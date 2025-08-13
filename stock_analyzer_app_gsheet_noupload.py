@@ -34,8 +34,9 @@ def get_gspread_client_from_secrets():
     sa_email = info.get("client_email", "(unknown)")
     return gc, sa_email
 
-@st.cache_resource(show_spinner=False)
-def get_spreadsheet_from_secrets(gc):
+def get_spreadsheet_from_secrets():
+    # 不加 cache_resource；或者也可以加但不传参以避免哈希问题
+    gc, _ = get_gspread_client_from_secrets()
     gsheet_url = st.secrets.get("google_sheet_url", "").strip()
     if not gsheet_url:
         st.error("未在 st.secrets 中找到 google_sheet_url。请填入你的 Google 表格链接。")
@@ -66,7 +67,7 @@ def ensure_worksheet(sh, title: str, rows=1000, cols=26):
 
 # 拿到 gspread 客户端 & 表格
 gc, sa_email = get_gspread_client_from_secrets()
-sh = get_spreadsheet_from_secrets(gc)
+sh = get_spreadsheet_from_secrets()
 st.sidebar.success(f"已连接 Google 表格（Service Account: {sa_email}）")
 
 # ====================== Fidelity 计算（不计费用，FIFO） ======================
