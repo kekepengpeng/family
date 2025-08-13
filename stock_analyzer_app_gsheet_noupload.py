@@ -1,15 +1,18 @@
 
-import streamlit as st
-import pandas as pd
-import numpy as np
+import os
+import json
 import re
 from datetime import date, datetime
+
+import numpy as np
+import pandas as pd
+import streamlit as st
 
 st.set_page_config(page_title="Investment收益分析", layout="wide")
 st.title("📈 Investment收益分析")
 st.caption("步骤 1 导入 Fidelity数据；步骤 2 浏览分析结果；步骤 3 可选择保存 新Fidelity 到 Google。")
 
-# ====================== Google Sheets 连接工具（无需上传，直接用 st.secrets） ======================
+# ====================== Google Sheets 连接工具（支持多种 secrets 写法） ======================
 import gspread
 from google.oauth2.service_account import Credentials
 from gspread_dataframe import set_with_dataframe, get_as_dataframe
@@ -22,31 +25,78 @@ def get_spreadsheet_id_from_url(url: str):
     m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
     return m.group(1) if m else None
 
+def load_service_account_info_from_secrets():
+    """
+    支持两种写法：
+    1) TOML 表写法（推荐）：
+       [gcp_service_account]
+       type="service_account"
+       client_email="..."
+       private_key="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+       ...
+
+    2) JSON 字符串写法：
+       gcp_service_account = """
+       { "type":"service_account", "client_email":"...", "private_key":"..."} 
+       """
+    """
+    # 先找 table
+    if "gcp_service_account" in st.secrets:
+        v = st.secrets["gcp_service_account"]
+        # 可能是 dict，也可能是字符串
+        if isinstance(v, str):
+            # JSON 字符串
+            try:
+                info = json.loads(v)
+                return info
+            except Exception as e:
+                st.error(f"gcp_service_account 是字符串但不是有效 JSON：{e}")
+                st.stop()
+        else:
+            # 映射/表
+            try:
+                return dict(v)
+            except Exception as e:
+                st.error(f"无法解析 gcp_service_account（应为表/字典或 JSON 字符串）：{e}")
+                st.stop()
+
+    # 兼容备用 key 名
+    if "gcp_service_account_json" in st.secrets:
+        try:
+            return json.loads(st.secrets["gcp_service_account_json"])
+        except Exception as e:
+            st.error(f"gcp_service_account_json 不是有效 JSON：{e}")
+            st.stop()
+
+    st.error("未在 st.secrets 中找到 gcp_service_account 或 gcp_service_account_json。请配置 Service Account JSON。")
+    st.stop()
+
+def load_google_sheet_url_from_secrets():
+    # 优先从 secrets 取；没有则尝试环境变量（方便本地调试）
+    url = st.secrets.get("google_sheet_url", "").strip() if hasattr(st, "secrets") else ""
+    if not url:
+        url = os.environ.get("GOOGLE_SHEET_URL", "").strip()
+    if not url:
+        st.error("未在 st.secrets 中找到 google_sheet_url（或环境变量 GOOGLE_SHEET_URL）。请填入你的 Google 表格链接。")
+        st.stop()
+    return url
+
 @st.cache_resource(show_spinner=False)
 def get_gspread_client_from_secrets():
-    try:
-        info = dict(st.secrets["gcp_service_account"])
-    except Exception as e:
-        st.error("未在 st.secrets 中找到 gcp_service_account。请在部署平台的 Secrets 中配置完整的 Service Account JSON。")
-        st.stop()
+    info = load_service_account_info_from_secrets()
     creds = Credentials.from_service_account_info(info, scopes=SCOPE)
     gc = gspread.authorize(creds)
     sa_email = info.get("client_email", "(unknown)")
     return gc, sa_email
 
 def get_spreadsheet_from_secrets():
-    # 不加 cache_resource；或者也可以加但不传参以避免哈希问题
+    # 不缓存参数，避免 UnhashableParamError
     gc, _ = get_gspread_client_from_secrets()
-    gsheet_url = st.secrets.get("google_sheet_url", "").strip()
-    if not gsheet_url:
-        st.error("未在 st.secrets 中找到 google_sheet_url。请填入你的 Google 表格链接。")
-        st.stop()
+    gsheet_url = load_google_sheet_url_from_secrets()
     try:
-        # 用 URL 打开（更稳，不依赖提取 ID）
         sh = gc.open_by_url(gsheet_url)
         return sh
-    except Exception as e:
-        # 回退用 ID
+    except Exception:
         sid = get_spreadsheet_id_from_url(gsheet_url)
         if not sid:
             st.error(f"无法从 google_sheet_url 解析表格ID：{gsheet_url}")
@@ -55,7 +105,7 @@ def get_spreadsheet_from_secrets():
             sh = gc.open_by_key(sid)
             return sh
         except Exception as ee:
-            st.error(f"无法打开 Google 表格（请确认已将该表共享给 Service Account）：{ee}")
+            st.error(f"无法打开 Google 表格（请确认已将该表共享给 Service Account 的 client_email）：{ee}")
             st.stop()
 
 def ensure_worksheet(sh, title: str, rows=1000, cols=26):
@@ -65,10 +115,15 @@ def ensure_worksheet(sh, title: str, rows=1000, cols=26):
         ws = sh.add_worksheet(title=title, rows=str(rows), cols=str(cols))
     return ws
 
-# 拿到 gspread 客户端 & 表格
+# 连接 Google
 gc, sa_email = get_gspread_client_from_secrets()
 sh = get_spreadsheet_from_secrets()
-st.sidebar.success(f"已连接 Google 表格（Service Account: {sa_email}）")
+
+# 侧边栏健康检查（不显示敏感信息）
+st.sidebar.header("🔐 Google 连接状态")
+st.sidebar.success("已连接 Google 表格")
+st.sidebar.caption(f"Service Account：{sa_email}")
+st.sidebar.caption("如报无权限，请将目标表格共享给上面这个邮箱（编辑权限）。")
 
 # ====================== Fidelity 计算（不计费用，FIFO） ======================
 def to_float(x):
