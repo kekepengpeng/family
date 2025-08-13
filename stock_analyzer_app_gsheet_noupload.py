@@ -26,6 +26,20 @@ def get_spreadsheet_id_from_url(url: str):
     return m.group(1) if m else None
 
 def load_service_account_info_from_secrets():
+    """
+    支持两种写法：
+    1) TOML 表写法（推荐）：
+       [gcp_service_account]
+       type="service_account"
+       client_email="..."
+       private_key="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
+       ...
+
+    2) JSON 字符串写法：
+       gcp_service_account = """
+       { "type":"service_account", "client_email":"...", "private_key":"..."} 
+       """
+    """
     # 先找 table
     if "gcp_service_account" in st.secrets:
         v = st.secrets["gcp_service_account"]
@@ -129,10 +143,15 @@ def detect_columns(df):
     action_col = cols.get("action") or cols.get("description") or cols.get("type")
     qty_col = cols.get("quantity") or cols.get("qty") or cols.get("shares")
     price_col = cols.get("price ($)") or cols.get("price") or cols.get("fill price")
+    # optional account column
+    account_col = (
+        cols.get("account name") or cols.get("account") or cols.get("account type") or cols.get("account description")
+        or cols.get("account number") or cols.get("acct")
+    )
     need = [date_col, ticker_col, action_col, qty_col, price_col]
     if any(x is None for x in need):
         st.error("无法识别必要列：日期、代码、操作、数量、价格。"); return None
-    return {"date":date_col,"ticker":ticker_col,"action":action_col,"qty":qty_col,"price":price_col}
+    return {"date":date_col,"ticker":ticker_col,"action":action_col,"qty":qty_col,"price":price_col,"account":account_col}
 
 def map_action(s: str):
     s = str(s).upper()
@@ -153,23 +172,31 @@ def prepare_trades(df: pd.DataFrame):
     d["方向"] = d[mp["action"]].map(map_action)
     d["数量"] = d[mp["qty"]].apply(to_float).abs()
     d["价格"] = d[mp["price"]].apply(to_float)
+    # 账户
+    if mp.get("account") is not None:
+        d["账户"] = d[mp["account"]].astype(str).str.strip()
+        d.loc[d["账户"].eq("") | d["账户"].isna(), "账户"] = "默认账户"
+    else:
+        d["账户"] = "默认账户"
     d = d[(~d["日期"].isna()) & (~d["代码"].isna()) & (~d["方向"].isna()) & (d["数量"]>0) & (~d["价格"].isna())]
-    d = d.sort_values(["代码","日期"]).reset_index(drop=True)
+    d = d.sort_values(["账户","代码","日期"]).reset_index(drop=True)
     return d
 
 def fifo_analyze(trade_df: pd.DataFrame):
     realized = []
     holdings = {}
     for _, row in trade_df.iterrows():
+        acct=row.get("账户","默认账户")
         tkr=row["代码"]; side=row["方向"]; qty=float(row["数量"]); price=float(row["价格"]); date=row["日期"]
-        holdings.setdefault(tkr, [])
+        key=(acct,tkr)
+        holdings.setdefault(key, [])
         if side=="BUY":
             total_cost = qty*price  # 不计费用
-            holdings[tkr].append({"date":date, "qty":qty, "cps": total_cost/qty})
+            holdings[key].append({"date":date, "qty":qty, "cps": total_cost/qty})
         elif side=="SELL":
             rem = qty
-            while rem>0 and holdings[tkr]:
-                lot = holdings[tkr][0]
+            while rem>0 and holdings.get(key,[]):
+                lot = holdings[key][0]
                 used = min(rem, lot["qty"])
                 pnl_wo = used*(price - lot["cps"])  # 不计费用
                 cost_used = used*lot["cps"]
@@ -177,6 +204,7 @@ def fifo_analyze(trade_df: pd.DataFrame):
                 roi = pnl_wo / cost_used if cost_used>0 else np.nan
                 ann = ((1+roi)**(365.0/days)-1) if (days>0 and pd.notna(roi)) else roi
                 realized.append({
+                    "账户": acct,
                     "代码": tkr,
                     "买入日期": lot["date"].date(),
                     "买入成本(每股)": lot["cps"],
@@ -191,16 +219,16 @@ def fifo_analyze(trade_df: pd.DataFrame):
                 lot["qty"] -= used
                 rem -= used
                 if lot["qty"] <= 1e-9:
-                    holdings[tkr].pop(0)
+                    holdings[key].pop(0)
 
     # 当前持仓（加权均价）
     hold_rows=[]
-    for tkr,lots in holdings.items():
+    for (acct,tkr),lots in holdings.items():
         qty = sum(l["qty"] for l in lots)
         if qty<=0: continue
         cost = sum(l["qty"]*l["cps"] for l in lots)
-        hold_rows.append({"代码":tkr,"持仓数量":qty,"持仓均价":cost/qty,"持仓批次":len(lots)})
-    holdings_df = pd.DataFrame(hold_rows).sort_values("代码")
+        hold_rows.append({"账户":acct, "代码":tkr, "持仓数量":qty, "持仓均价":cost/qty, "持仓批次":len(lots)})
+    holdings_df = pd.DataFrame(hold_rows).sort_values(["账户","代码"])
 
     realized_df = pd.DataFrame(realized)
 
@@ -293,7 +321,14 @@ tab1, tab2, tab3, tab4 = st.tabs(["① 当前仍持有（Fidelity）", "② 已�
 with tab1:
     st.subheader("📌 当前仍持有（加权均价 & 数量）")
     if not holdings_df.empty:
-        st.dataframe(holdings_df.round(6), use_container_width=True)
+        if "账户" in holdings_df.columns:
+            for acct, dfsub in holdings_df.groupby("账户"):
+                st.markdown(f"**账户：{acct}**")
+                st.dataframe(dfsub.round(6).reset_index(drop=True), use_container_width=True)
+                st.markdown(" ")
+        else:
+            st.markdown("**账户：默认账户**")
+            st.dataframe(holdings_df.round(6), use_container_width=True)
     else:
         st.write("（暂无数据）")
 
