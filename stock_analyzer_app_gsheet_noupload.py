@@ -26,20 +26,7 @@ def get_spreadsheet_id_from_url(url: str):
     return m.group(1) if m else None
 
 def load_service_account_info_from_secrets():
-    """
-    支持两种写法：
-    1) TOML 表写法（推荐）：
-       [gcp_service_account]
-       type="service_account"
-       client_email="..."
-       private_key="-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n"
-       ...
-
-    2) JSON 字符串写法：
-       gcp_service_account = """
-       { "type":"service_account", "client_email":"...", "private_key":"..."} 
-       """
-    """
+    
     # 先找 table
     if "gcp_service_account" in st.secrets:
         v = st.secrets["gcp_service_account"]
